@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>Zonenfrei</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  :root{--p:#0f766e;--p2:#115e59;--bg:#f4f7f7;--card:#fff;--text:#102a2a;--muted:#64748b;--danger:#b91c1c;--warn:#b45309}
+  *{box-sizing:border-box} html,body,#map{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--text)}
+  body{background:var(--bg);overflow:hidden}.leaflet-control-attribution{font-size:9px}
+  #map{position:absolute;inset:0}
+  .top{position:absolute;z-index:999;left:10px;right:10px;top:10px;display:flex;flex-direction:column;gap:8px}
+  .card{background:rgba(255,255,255,.97);border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.16);padding:10px}
+  .brand{display:flex;align-items:center;justify-content:space-between;font-weight:800;color:var(--p2)}
+  .brand button{border:0;background:#e6fffb;color:var(--p2);padding:8px 10px;border-radius:10px;font-weight:700}
+  .panel{display:none;gap:8px}.panel.open{display:grid}
+  .row{display:flex;gap:8px}.row>*{flex:1}
+  input,select,button{font:inherit} input,select{width:100%;padding:11px;border-radius:11px;border:1px solid #cbd5e1;background:white}
+  button.primary{border:0;background:var(--p);color:white;padding:11px 12px;border-radius:11px;font-weight:800}
+  button.secondary{border:1px solid #99caca;background:white;color:var(--p2);padding:10px;border-radius:11px;font-weight:700}
+  .chips{display:flex;gap:6px;overflow:auto;padding-bottom:2px}.chip{white-space:nowrap;border:1px solid #cbd5e1;background:white;border-radius:999px;padding:7px 10px;font-size:13px}.chip.on{background:#d1fae5;border-color:#34d399}
+  .status{font-size:12px;color:var(--muted);line-height:1.35}.status.bad{color:var(--danger)}.status.warn{color:var(--warn)}
+  .bottom{position:absolute;z-index:999;left:10px;right:10px;bottom:12px;display:flex;gap:8px}.bottom button{flex:1}
+  .zone-label{background:#fff3cd;border:1px solid #f59e0b;border-radius:8px;padding:2px 6px;font-size:11px;color:#7c2d12}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="top">
+  <div class="card brand">
+    <div>🟢 Zonenfrei <span style="font-size:12px;color:#64748b">1.1</span></div>
+    <button id="toggle">Route & Filter</button>
+  </div>
+
+  <div class="card panel" id="panel">
+    <div class="row">
+      <button class="secondary" id="gps">📍 Aktueller Standort</button>
+      <button class="secondary" id="swap">⇅ Tauschen</button>
+    </div>
+    <input id="start" placeholder="Startadresse oder GPS"/>
+    <input id="dest" placeholder="Zieladresse"/>
+    <div class="row">
+      <button class="primary" id="route">Route berechnen</button>
+      <button class="secondary" id="clear">Zurücksetzen</button>
+    </div>
+
+    <div class="chips">
+      <button class="chip on" data-country="DE">🇩🇪 Deutschland</button>
+      <button class="chip on" data-country="FR">🇫🇷 Frankreich</button>
+      <button class="chip on" data-country="BE">🇧🇪 Belgien</button>
+      <button class="chip on" data-country="NL">🇳🇱 Niederlande</button>
+      <button class="chip on" data-country="IT">🇮🇹 Italien</button>
+      <button class="chip on" data-country="ES">🇪🇸 Spanien</button>
+    </div>
+    <div class="status" id="status">Bereit. Für Umweltzonen werden OpenStreetMap-Daten im sichtbaren Kartenbereich geladen.</div>
+  </div>
+</div>
+
+<div class="bottom">
+  <button class="primary" id="zones">Umweltzonen aktualisieren</button>
+  <button class="secondary" id="gmaps">In Google Maps öffnen</button>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map=L.map('map',{zoomControl:false}).setView([53.55,9.99],8);
+L.control.zoom({position:'bottomright'}).addTo(map);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
+
+let startCoord=null,destCoord=null,routeLayer=null,startMarker=null,destMarker=null;
+let zoneLayer=L.layerGroup().addTo(map), lastZones=[], activeCountries=new Set(['DE','FR','BE','NL','IT','ES']);
+
+const $=id=>document.getElementById(id);
+$('toggle').onclick=()=>$('panel').classList.toggle('open');
+function $$(sel){return [...document.querySelectorAll(sel)]}
+$$('.chip').forEach(b=>b.onclick=()=>{b.classList.toggle('on');const c=b.dataset.country;b.classList.contains('on')?activeCountries.add(c):activeCountries.delete(c);redrawZones()});
+
+function setStatus(t,cls=''){const e=$('status');e.textContent=t;e.className='status '+cls}
+function marker(coord,label,color){
+  return L.circleMarker([coord.lat,coord.lon],{radius:7,color,weight:3,fillOpacity:.8}).bindTooltip(label,{permanent:false});
+}
+async function geocode(q){
+  const u='https://nominatim.openstreetmap.org/search?format=json&limit=1&addressdetails=1&q='+encodeURIComponent(q);
+  const r=await fetch(u,{headers:{'Accept-Language':'de'}}); const j=await r.json();
+  if(!j.length) throw new Error('Adresse nicht gefunden');
+  return {lat:+j[0].lat,lon:+j[0].lon,name:j[0].display_name,country:(j[0].address?.country_code||'').toUpperCase()};
+}
+async function reverse(lat,lon){
+  const u=`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`;
+  const r=await fetch(u,{headers:{'Accept-Language':'de'}}); const j=await r.json(); return j.display_name||`${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+}
+$('gps').onclick=()=>navigator.geolocation.getCurrentPosition(async p=>{
+  startCoord={lat:p.coords.latitude,lon:p.coords.longitude};
+  $('start').value=await reverse(startCoord.lat,startCoord.lon);
+  if(startMarker)map.removeLayer(startMarker); startMarker=marker(startCoord,'Start','#0f766e').addTo(map); map.setView([startCoord.lat,startCoord.lon],13);
+  setStatus('Aktueller Standort als Start übernommen.');
+},e=>setStatus('Standort konnte nicht ermittelt werden: '+e.message,'bad'),{enableHighAccuracy:true,timeout:12000});
+
+$('swap').onclick=()=>{
+  const sv=$('start').value;$('start').value=$('dest').value;$('dest').value=sv;
+  [startCoord,destCoord]=[destCoord,startCoord];
+}
+$('clear').onclick=()=>{
+  $('start').value='';$('dest').value='';startCoord=destCoord=null;
+  if(routeLayer)map.removeLayer(routeLayer); if(startMarker)map.removeLayer(startMarker); if(destMarker)map.removeLayer(destMarker);
+  startMarker=destMarker=routeLayer=null;setStatus('Zurückgesetzt.');
+}
+
+function pointInPoly(pt, poly){
+  let x=pt[1],y=pt[0],inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    let xi=poly[i][1],yi=poly[i][0],xj=poly[j][1],yj=poly[j][0];
+    let inter=((yi>y)!=(yj>y))&&(x<(xj-xi)*(y-yi)/(yj-yi+1e-12)+xi);if(inter)inside=!inside;
+  }return inside;
+}
+function routeHitsZones(coords){
+  let hits=new Set();
+  for(const z of lastZones){
+    if(!activeCountries.has(z.country)) continue;
+    outer: for(const poly of z.polygons){
+      for(let i=0;i<coords.length;i+=Math.max(1,Math.floor(coords.length/300))){
+        if(pointInPoly([coords[i][1],coords[i][0]],poly)){hits.add(z.name);break outer;}
+      }
+    }
+  } return [...hits];
+}
+
+$('route').onclick=async()=>{
+ try{
+   setStatus('Adressen und Route werden berechnet …');
+   if(!startCoord) startCoord=await geocode($('start').value);
+   if(!destCoord) destCoord=await geocode($('dest').value);
+   if(startMarker)map.removeLayer(startMarker); if(destMarker)map.removeLayer(destMarker);
+   startMarker=marker(startCoord,'Start','#0f766e').addTo(map); destMarker=marker(destCoord,'Ziel','#2563eb').addTo(map);
+   const u=`https://router.project-osrm.org/route/v1/driving/${startCoord.lon},${startCoord.lat};${destCoord.lon},${destCoord.lat}?alternatives=true&overview=full&geometries=geojson`;
+   const r=await fetch(u);const j=await r.json(); if(!j.routes?.length)throw new Error('Keine Route gefunden');
+   let best=j.routes[0], bestHits=999;
+   for(const rt of j.routes){
+     const h=routeHitsZones(rt.geometry.coordinates).length;if(h<bestHits){best=rt;bestHits=h;}
+   }
+   if(routeLayer)map.removeLayer(routeLayer);
+   routeLayer=L.geoJSON(best.geometry,{style:{color:'#0f766e',weight:6,opacity:.88}}).addTo(map);
+   map.fitBounds(routeLayer.getBounds(),{padding:[30,30]});
+   const hits=routeHitsZones(best.geometry.coordinates);
+   const km=(best.distance/1000).toFixed(1),min=Math.round(best.duration/60);
+   if(hits.length) setStatus(`Route: ${km} km, ca. ${min} Min. Achtung: berührt ${hits.length} erkannte Umweltzone(n): ${hits.join(', ')}`,'warn');
+   else setStatus(`Route: ${km} km, ca. ${min} Min. Keine der aktuell geladenen Umweltzonen wird erkannt.`);
+ }catch(e){setStatus(e.message,'bad')}
+}
+
+function boundsToOverpass(){
+ const b=map.getBounds(); return `${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}`;
+}
+function detectCountry(tags){
+ const c=(tags['addr:country']||tags['ISO3166-1']||tags['country']||'').toUpperCase();
+ return c||'DE';
+}
+async function loadZones(){
+  try{
+    setStatus('Umweltzonen werden aus OpenStreetMap geladen …');
+    const bbox=boundsToOverpass();
+    const q=`[out:json][timeout:20];(way["boundary"="low_emission_zone"](${bbox});relation["boundary"="low_emission_zone"](${bbox});way["type"="low_emission_zone"](${bbox});relation["type"="low_emission_zone"](${bbox});way["zone:traffic"](${bbox});relation["zone:traffic"](${bbox}););out geom;`;
+    const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',body:q});
+    const j=await r.json(); lastZones=[];
+    for(const el of j.elements||[]){
+      const tags=el.tags||{}, name=tags.name||tags.ref||'Umweltzone';
+      const country=detectCountry(tags);
+      let polys=[];
+      if(el.geometry?.length>2) polys.push(el.geometry.map(p=>[p.lat,p.lon]));
+      if(el.members) for(const m of el.members) if(m.geometry?.length>2) polys.push(m.geometry.map(p=>[p.lat,p.lon]));
+      if(polys.length) lastZones.push({name,country,tags,polygons:polys});
+    }
+    redrawZones();
+    setStatus(`${lastZones.length} Umweltzonen/Verkehrszonen im aktuellen Kartenausschnitt gefunden. OSM-Daten können je nach Land unvollständig sein.`);
+  }catch(e){setStatus('Umweltzonen konnten nicht geladen werden: '+e.message,'bad')}
+}
+function redrawZones(){
+  zoneLayer.clearLayers();
+  for(const z of lastZones){
+    if(!activeCountries.has(z.country))continue;
+    for(const p of z.polygons)L.polygon(p,{color:'#dc2626',weight:2,fillColor:'#ef4444',fillOpacity:.13}).bindTooltip(z.name,{className:'zone-label'}).addTo(zoneLayer);
+  }
+}
+$('zones').onclick=loadZones;
+
+$('gmaps').onclick=()=>{
+  if(!destCoord && !$('dest').value.trim()){setStatus('Bitte zuerst ein Ziel eingeben.','bad');return}
+  const origin=startCoord?`${startCoord.lat},${startCoord.lon}`:encodeURIComponent($('start').value);
+  const dest=destCoord?`${destCoord.lat},${destCoord.lon}`:encodeURIComponent($('dest').value);
+  const u=`https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${dest}&travelmode=driving`;
+  if(window.Android?.openGoogleMaps) Android.openGoogleMaps(u); else location.href=u;
+}
+
+setTimeout(()=>{$('panel').classList.add('open')},350);
+</script>
+</body>
+</html>
